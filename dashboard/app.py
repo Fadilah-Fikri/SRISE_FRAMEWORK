@@ -141,3 +141,28 @@ st_folium(
     width=1200,
     height=600
 )
+
+st.subheader("📋 Filtered Earthquake Anomaly Events")
+
+anomaly_df = filtered_df[
+    filtered_df["anomaly_score"] == -1
+]
+
+st.metric(
+    "Filtered Anomaly Events",
+    len(anomaly_df)
+)
+
+st.dataframe(
+    anomaly_df[
+        [
+            "date",
+            "time",
+            "location",
+            "magnitude",
+            "depth",
+            "risk_score"
+        ]
+    ],
+    use_container_width=True
+)
