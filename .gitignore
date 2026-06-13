@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# virtual environment
+.venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# jupyter
+.ipynb_checkpoints/
+
+# streamlit
+.streamlit/
+
+# model artifacts
+models/*.pkl
+models/*.joblib
