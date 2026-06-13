@@ -1,0 +1,5 @@
+DBSCAN → Spatial clustering
+KDE → Density estimation
+Moran’s I → Spatial autocorrelation
+Risk Index → Composite risk scoring
+Isolation Forest → anomaly detection
