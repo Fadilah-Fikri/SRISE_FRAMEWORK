@@ -30,6 +30,43 @@ def load_data():
 
 df = load_data()
 
+EXPECTED_COLUMNS = {
+    "id",
+    "eventid",
+    "date",
+    "time",
+    "latitude",
+    "longitude",
+    "magnitude",
+    "mag_type",
+    "depth",
+    "phasecount",
+    "azimuth_gap",
+    "location",
+    "datetime",
+    "location_frequency",
+    "cluster",
+    "density_score",
+    "mag_norm",
+    "depth_norm",
+    "freq_norm",
+    "density_norm",
+    "risk_score",
+    "anomaly_score",
+}
+
+def validate_anomaly_schema(df):
+    columns_lower = {c.strip().lower(): c for c in df.columns}
+    missing = [c for c in EXPECTED_COLUMNS if c not in columns_lower]
+    return missing, columns_lower
+
+missing_columns, _ = validate_anomaly_schema(df)
+if missing_columns:
+    st.error(
+        "Dataset outputs/anomalies.csv tidak lengkap atau formatnya salah. "
+        "Pastikan file memiliki kolom yang sama seperti format anomaly dataset sebelumnya."
+    )
+
 # =========================
 # SIDEBAR FILTER
 # =========================
@@ -69,12 +106,25 @@ if uploaded_file is not None:
 
         do_backup = st.sidebar.checkbox("Backup dataset lama sebelum terapkan", value=True)
 
-        # validasi kolom wajib (case-insensitive)
-        required_cols = {"latitude", "longitude", "magnitude"}
-        cols_lower = [c.strip().lower() for c in uploaded_df.columns]
+        required_cols = {
+            "latitude",
+            "longitude",
+            "magnitude",
+            "risk_score",
+            "anomaly_score",
+            "location",
+            "cluster",
+            "date",
+            "time",
+            "depth",
+        }
+
+        cols_lower = {c.strip().lower(): c for c in uploaded_df.columns}
         missing_cols = [c for c in required_cols if c not in cols_lower]
         if missing_cols:
-            st.sidebar.error(f"Kolom wajib hilang: {', '.join(missing_cols)}. Aksi Replace/Append tidak akan dilakukan.")
+            st.sidebar.error(
+                f"Kolom wajib hilang: {', '.join(missing_cols)}. File tidak akan mengganti atau menambahkan dataset."
+            )
 
         if st.sidebar.button("Terapkan Unggahan"):
             out_path = Path("outputs") / "anomalies.csv"
@@ -83,7 +133,7 @@ if uploaded_file is not None:
 
             elif upload_action == "Ganti dataset (timpa)":
                 if missing_cols:
-                    st.sidebar.error("Tidak dapat mengganti dataset: kolom wajib hilang.")
+                    st.sidebar.error("Tidak dapat mengganti dataset: file tidak lengkap atau format salah.")
                 else:
                     if out_path.exists() and do_backup:
                         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -99,13 +149,13 @@ if uploaded_file is not None:
                             st.cache_data.clear()
                         except Exception:
                             pass
-                        st.experimental_rerun()
+                        st.rerun()
                     except Exception as e:
                         st.sidebar.error(f"Gagal menyimpan dataset: {e}")
 
             elif upload_action == "Tambahkan ke dataset":
                 if missing_cols:
-                    st.sidebar.error("Tidak dapat menambahkan dataset: kolom wajib hilang.")
+                    st.sidebar.error("Tidak dapat menambahkan dataset: file tidak lengkap atau format salah.")
                 else:
                     if out_path.exists():
                         existing = pd.read_csv(out_path)
@@ -140,7 +190,7 @@ if uploaded_file is not None:
                             st.cache_data.clear()
                         except Exception:
                             pass
-                        st.experimental_rerun()
+                        st.rerun()
                     except Exception as e:
                         st.sidebar.error(f"Gagal menambahkan dan menyimpan dataset: {e}")
 
@@ -167,12 +217,51 @@ else:
     display_df = filtered_df.copy()
 
 # =========================
-# METRICS
+# Risk category based on risk_score
+
+def categorize_risk(score):
+    if score >= 0.70:
+        return "bahaya"
+    if score >= 0.55:
+        return "cukup bahaya"
+    if score >= 0.45:
+        return "sedang"
+    return "tidak bahaya"
+
+# Add risk category labels to display_df
+display_df = display_df.copy()
+display_df["risk_category"] = display_df["risk_score"].apply(categorize_risk)
+
+risk_category_values = {
+    "tidak bahaya": 0,
+    "sedang": 1,
+    "cukup bahaya": 2,
+    "bahaya": 3,
+}
+display_df["risk_category_value"] = display_df["risk_category"].map(risk_category_values)
+
+display_df["risk_category"] = pd.Categorical(
+    display_df["risk_category"],
+    categories=["bahaya", "cukup bahaya", "sedang", "tidak bahaya"],
+    ordered=True,
+)
+
+color_by = st.sidebar.radio(
+    "Warna berdasarkan",
+    ("DBSCAN cluster", "Risk category"),
+    index=1
+)
+color_col = "cluster" if color_by == "DBSCAN cluster" else "risk_category"
+
 # =========================
+# METRICS
 col1, col2, col3, col4, col5 = st.columns(5)
 
 col1.metric("Total Earthquakes", len(filtered_df))
-col2.metric("Clusters", display_df["cluster"].nunique())
+col2.metric(
+    "Groups",
+    display_df["risk_category"].nunique() if color_by == "Risk category" else display_df["cluster"].nunique()
+)
 col3.metric(
     "Anomalies",
     (display_df["anomaly_score"] == -1).sum()
@@ -207,26 +296,39 @@ silhouette = _compute_silhouette(display_df)
 col5.metric("Silhouette Score", silhouette if silhouette is not None else "N/A")
 
 # =========================
+# Risk category summary
+risk_counts = display_df["risk_category"].value_counts().reindex([
+    "bahaya",
+    "cukup bahaya",
+    "sedang",
+    "tidak bahaya"
+], fill_value=0)
+summary_df = risk_counts.reset_index()
+summary_df.columns = ["risk_category", "count"]
+summary_df["risk_category_value"] = summary_df["risk_category"].map(risk_category_values)
+summary_df = summary_df.sort_values(by="risk_category_value", ascending=False).reset_index(drop=True)
+summary_df = summary_df[["risk_category", "risk_category_value", "count"]]
+summary_df = summary_df.rename(columns={
+    "risk_category": "Kategori Risiko",
+    "risk_category_value": "Nilai Risiko",
+    "count": "Jumlah"
+})
+
+st.subheader("Risk Category Summary")
+st.dataframe(summary_df, use_container_width=True)
+
+# =========================
 # CLUSTER VISUALIZATION
 # =========================
-# Show cluster counts so users see when Silhouette is available
-st.subheader("Cluster Counts")
-counts = display_df["cluster"].value_counts().sort_index()
-counts_df = counts.reset_index()
-counts_df.columns = ["cluster", "count"]
-st.dataframe(counts_df, use_container_width=True)
-
-fig_counts = px.bar(counts_df, x="cluster", y="count", title="Cluster Counts")
-st.plotly_chart(fig_counts, use_container_width=True)
-
 st.subheader("DBSCAN Cluster Segmentation")
 
 fig_cluster = px.scatter(
     display_df,
     x="longitude",
     y="latitude",
-    color="cluster",
-    hover_data=["magnitude", "risk_score"]
+    color=color_col,
+    hover_data=["magnitude", "risk_score", "risk_category"],
+    category_orders={"risk_category": ["bahaya", "cukup bahaya", "sedang", "tidak bahaya"]}
 )
 
 st.plotly_chart(
@@ -273,7 +375,14 @@ st.dataframe(
 # =========================
 # INTERACTIVE MAP
 # =========================
-st.subheader("Anomaly Risk Map")
+st.subheader("Risk Map")
+
+risk_colors = {
+    "bahaya": "red",
+    "cukup bahaya": "orange",
+    "sedang": "yellow",
+    "tidak bahaya": "green",
+}
 
 m = folium.Map(
     location=[-2.5, 118],
@@ -281,19 +390,24 @@ m = folium.Map(
 )
 
 for _, row in display_df.iterrows():
-    if row["anomaly_score"] == -1:
-        folium.CircleMarker(
-            location=[
-                row["latitude"],
-                row["longitude"]
-            ],
-            radius=4,
-            popup=(
-                f"Location: {row['location']}<br>"
-                f"Magnitude: {row['magnitude']}<br>"
-                f"Risk: {row['risk_score']:.2f}"
-            )
-        ).add_to(m)
+    color = risk_colors.get(row["risk_category"], "blue")
+    folium.CircleMarker(
+        location=[
+            row["latitude"],
+            row["longitude"]
+        ],
+        radius=3,
+        color=color,
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.6,
+        popup=(
+            f"Location: {row['location']}<br>"
+            f"Magnitude: {row['magnitude']}<br>"
+            f"Risk: {row['risk_score']:.2f}<br>"
+            f"Kategori: {row['risk_category']}"
+        )
+    ).add_to(m)
 
 st_folium(
     m,
