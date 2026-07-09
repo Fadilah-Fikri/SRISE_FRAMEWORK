@@ -2,12 +2,14 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import folium
+from folium.plugins import FastMarkerCluster
 from streamlit_folium import st_folium
 from sklearn.metrics import silhouette_score
 from sklearn.cluster import DBSCAN
 import shutil
 from pathlib import Path
 import datetime
+import json
 
 # =========================
 # CONFIG
@@ -253,6 +255,24 @@ color_by = st.sidebar.radio(
 )
 color_col = "cluster" if color_by == "DBSCAN cluster" else "risk_category"
 
+# -------------------------
+# Pengaturan Peta (Performance)
+# -------------------------
+st.sidebar.header("⚡ Pengaturan Peta")
+show_map = st.sidebar.checkbox(
+    "Tampilkan Risk Map",
+    value=False,
+    help="Nonaktifkan untuk mempercepat loading. Aktifkan hanya saat ingin melihat peta."
+)
+max_map_points = st.sidebar.slider(
+    "Maks. titik di peta",
+    min_value=100,
+    max_value=5000,
+    value=2000,
+    step=100,
+    help="Kurangi jumlah titik untuk peta lebih cepat. Sampling dilakukan secara stratifikasi per risk category."
+)
+
 # =========================
 # METRICS
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -377,43 +397,188 @@ st.dataframe(
 # =========================
 st.subheader("Risk Map")
 
-risk_colors = {
-    "bahaya": "red",
-    "cukup bahaya": "orange",
-    "sedang": "yellow",
-    "tidak bahaya": "green",
-}
+# ── Stratified sampling ────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def sample_map_data(data_json: str, max_pts: int) -> list:
+    """Lakukan stratified sampling per risk_category lalu kembalikan list
+    [lat, lon, risk_category, tooltip] untuk FastMarkerCluster.
+    Data di-cache berdasarkan konten data + max_pts agar tidak di-komputasi ulang.
+    """
+    rows = json.loads(data_json)
+    df_tmp = pd.DataFrame(rows)
+    categories = ["bahaya", "cukup bahaya", "sedang", "tidak bahaya"]
+    total = len(df_tmp)
+    sampled_parts = []
+    for cat in categories:
+        subset = df_tmp[df_tmp["risk_category"] == cat]
+        if len(subset) == 0:
+            continue
+        # Proporsi tiap kategori dipertahankan
+        n = max(1, int(max_pts * len(subset) / total))
+        if len(subset) > n:
+            subset = subset.sample(n=n, random_state=42)
+        sampled_parts.append(subset)
+    if not sampled_parts:
+        return []
+    sampled = pd.concat(sampled_parts, ignore_index=True)
+    result = [
+        [
+            float(r["latitude"]),
+            float(r["longitude"]),
+            str(r["risk_category"]),
+            str(r["location"]),
+            float(r["magnitude"]),
+            float(r["risk_score"])
+        ]
+        for _, r in sampled.iterrows()
+    ]
+    return result
 
-m = folium.Map(
-    location=[-2.5, 118],
-    zoom_start=5
-)
+if show_map:
+    # Siapkan data dalam format JSON untuk di-cache
+    map_cols = ["latitude", "longitude", "risk_category", "location", "magnitude", "risk_score"]
+    map_source = display_df[map_cols].copy()
+    # Konversi risk_category ke string agar JSON serializable
+    map_source["risk_category"] = map_source["risk_category"].astype(str)
+    data_json = map_source.to_json(orient="records")
 
-for _, row in display_df.iterrows():
-    color = risk_colors.get(row["risk_category"], "blue")
-    folium.CircleMarker(
-        location=[
-            row["latitude"],
-            row["longitude"]
-        ],
-        radius=3,
-        color=color,
-        fill=True,
-        fill_color=color,
-        fill_opacity=0.6,
-        popup=(
-            f"Location: {row['location']}<br>"
-            f"Magnitude: {row['magnitude']}<br>"
-            f"Risk: {row['risk_score']:.2f}<br>"
-            f"Kategori: {row['risk_category']}"
+    map_points = sample_map_data(data_json, max_map_points)
+    total_pts = len(display_df)
+    shown_pts = len(map_points)
+
+    if shown_pts < total_pts:
+        st.info(
+            f"ℹ️ Menampilkan **{shown_pts:,}** dari **{total_pts:,}** titik "
+            f"(sampling stratifikasi). Naikkan slider *'Maks. titik di peta'* untuk lebih banyak detail."
         )
-    ).add_to(m)
 
-st_folium(
-    m,
-    width=1200,
-    height=600
-)
+    # ── Bangun Folium map dengan FastMarkerCluster ─────────────────────────
+    # FastMarkerCluster meneruskan semua data ke Leaflet.js (browser)
+    # dan menggunakan JS callback untuk warna — jauh lebih cepat dari Python loop.
+    _js_callback = """
+    function (row) {
+        var colorMap = {
+            'bahaya'       : '#e53935',
+            'cukup bahaya' : '#fb8c00',
+            'sedang'       : '#fdd835',
+            'tidak bahaya' : '#43a047'
+        };
+        var labelMap = {
+            'bahaya'       : 'Bahaya',
+            'cukup bahaya' : 'Cukup Bahaya',
+            'sedang'       : 'Sedang',
+            'tidak bahaya' : 'Tidak Bahaya'
+        };
+        var cat      = row[2];
+        var location = row[3];
+        var mag      = parseFloat(row[4]).toFixed(1);
+        var risk     = parseFloat(row[5]).toFixed(2);
+        var color    = colorMap[cat] || '#2196f3';
+        var label    = labelMap[cat]  || cat;
+
+        var dot = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + color + ';border-radius:50%;'
+                + 'margin-right:5px;vertical-align:middle;"></span>';
+
+        var tooltipHtml =
+            '<div style="font-family:sans-serif;font-size:12px;line-height:1.7;">'
+          + '<b style="font-size:13px;">' + dot + label + '</b><br>'
+          + '<b>Lokasi:</b> ' + location + '<br>'
+          + '<b>Magnitudo:</b> ' + mag + '<br>'
+          + '<b>Risk Score:</b> ' + risk
+          + '</div>';
+
+        var marker = L.circleMarker(
+            [row[0], row[1]],
+            {
+                radius      : 5,
+                color       : color,
+                fillColor   : color,
+                fillOpacity : 0.75,
+                weight      : 1
+            }
+        );
+        marker.bindTooltip(tooltipHtml, {sticky: true});
+        return marker;
+    }
+    """
+
+    m = folium.Map(location=[-2.5, 118], zoom_start=5, prefer_canvas=True)
+
+    # Legend dengan deskripsi kriteria tiap kategori
+    legend_html = """
+    <div style="position:fixed;bottom:30px;left:30px;z-index:9999;
+                background:rgba(255,255,255,0.96);padding:12px 16px;
+                border-radius:10px;border:1px solid #ddd;
+                font-family:sans-serif;font-size:12px;color:#111;
+                box-shadow:0 2px 10px rgba(0,0,0,0.15);
+                white-space:nowrap;">
+        <div style="font-size:12px;font-weight:700;margin-bottom:8px;
+                    border-bottom:1px solid #eee;padding-bottom:5px;
+                    letter-spacing:0.3px;">Kategori Risiko Gempa</div>
+        <table style="border-collapse:collapse;width:100%;">
+            <tr>
+                <td style="padding:3px 10px 3px 0;">
+                    <span style="display:inline-block;width:11px;height:11px;
+                                 background:#e53935;border-radius:50%;
+                                 vertical-align:middle;margin-right:6px;"></span>
+                    <b>Bahaya</b>
+                </td>
+                <td style="color:#222;font-size:11px;padding:3px 0;">skor &ge;&nbsp;0.70</td>
+            </tr>
+            <tr>
+                <td style="padding:3px 10px 3px 0;">
+                    <span style="display:inline-block;width:11px;height:11px;
+                                 background:#fb8c00;border-radius:50%;
+                                 vertical-align:middle;margin-right:6px;"></span>
+                    <b>Cukup Bahaya</b>
+                </td>
+                <td style="color:#222;font-size:11px;padding:3px 0;">skor 0.55&ndash;0.69</td>
+            </tr>
+            <tr>
+                <td style="padding:3px 10px 3px 0;">
+                    <span style="display:inline-block;width:11px;height:11px;
+                                 background:#fdd835;border-radius:50%;
+                                 vertical-align:middle;margin-right:6px;"></span>
+                    <b>Sedang</b>
+                </td>
+                <td style="color:#222;font-size:11px;padding:3px 0;">skor 0.45&ndash;0.54</td>
+            </tr>
+            <tr>
+                <td style="padding:3px 10px 3px 0;">
+                    <span style="display:inline-block;width:11px;height:11px;
+                                 background:#43a047;border-radius:50%;
+                                 vertical-align:middle;margin-right:6px;"></span>
+                    <b>Tidak Bahaya</b>
+                </td>
+                <td style="color:#222;font-size:11px;padding:3px 0;">skor &lt;&nbsp;0.45</td>
+            </tr>
+        </table>
+        <div style="margin-top:7px;padding-top:6px;border-top:1px solid #eee;
+                    color:#444;font-size:10.5px;line-height:1.5;">
+            Arahkan kursor ke titik untuk detail
+        </div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    if map_points:
+        FastMarkerCluster(
+            data=map_points,
+            callback=_js_callback,
+            disableClusteringAtZoom=8,  # tampilkan individual marker saat zoom in
+        ).add_to(m)
+
+    # returned_objects=[] mencegah data dikirim balik ke Python saat klik
+    # (menghilangkan re-render Streamlit yang tidak perlu)
+    st_folium(
+        m,
+        width="100%",
+        height=600,
+        returned_objects=[]
+    )
+else:
+    st.info("🗺️ Risk Map dinonaktifkan. Centang **'Tampilkan Risk Map'** di sidebar untuk memuat peta.")
 
 st.subheader("📋 Filtered Earthquake Anomaly Events")
 
